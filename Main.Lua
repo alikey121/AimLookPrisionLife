@@ -1,6 +1,7 @@
 -- SERVICIOS
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService") -- Añadido para mejorar soporte móvil
 
 -- VARIABLES PRINCIPALES
 local LocalPlayer = Players.LocalPlayer
@@ -27,8 +28,29 @@ menuFrame.Size = UDim2.new(0, 190, 0, 100)
 menuFrame.Position = UDim2.new(0.7, 0, 0.5, 0)
 menuFrame.BackgroundColor3 = Color3.fromRGB(15, 15, 15) -- Fondo Negro oscuro
 menuFrame.Active = true
-menuFrame.Draggable = true 
 menuFrame.Parent = screenGui
+
+-- Sistema de arrastre manual optimizado para ejecutores móviles (Delta Fix)
+local dragging, dragInput, dragStart, startPos
+menuFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = menuFrame.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then dragging = false end
+        end)
+    end
+end)
+menuFrame.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        local delta = input.Position - dragStart
+        menuFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+    end
+end)
 
 -- Borde Rojo para el cuadro
 local menuStroke = Instance.new("UIStroke")
@@ -88,7 +110,30 @@ corner2.CornerRadius = UDim.new(0, 8)
 corner2.Parent = spyButton
 
 
--- 2. LÓGICA DE AUTO-APUNTADO RESPECTO A LA MIRA (AL CENTRO DE LA PANTALLA)
+-- FUNCIÓN DE WALL CHECK (NUEVA: Evita apuntar a través de paredes)
+local function isVisible(targetCharacter)
+    if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("HumanoidRootPart") then return false end
+    if not targetCharacter or not targetCharacter:FindFirstChild("HumanoidRootPart") then return false end
+
+    local origin = Camera.CFrame.Position
+    local destination = targetCharacter.HumanoidRootPart.Position
+    local direction = destination - origin
+
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.FilterDescendantsInstances = {LocalPlayer.Character, Camera}
+    raycastParams.IgnoreWater = true
+
+    local result = workspace:Raycast(origin, direction, raycastParams)
+
+    if not result or result.Instance:IsDescendantOf(targetCharacter) then
+        return true
+    end
+    return false
+end
+
+
+-- 2. LÓGICA DE AUTO-APUNTADO RESPECTO A LA MIRA (CON FILTRO DE PAREDES)
 local function getClosestStrictEnemy()
 	local closestPlayer = nil
 	local shortestDistance = math.huge
@@ -96,7 +141,7 @@ local function getClosestStrictEnemy()
 	local myTeam = LocalPlayer.Team
 	if not myTeam then return nil end
 	
-	-- Configuración estricta de contrincantes (Corregida y completa)
+	-- Configuración estricta de contrincantes
 	local enemyTeams = {}
 	if myTeam.Name == "Guards" then
 		enemyTeams["Criminals"] = true
@@ -115,16 +160,18 @@ local function getClosestStrictEnemy()
 		if player ~= LocalPlayer and player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character:FindFirstChildOfClass("Humanoid").Health > 0 then
 			if player.Team and enemyTeams[player.Team.Name] then
 				
-				-- Regresamos al cálculo basándonos en la posición dentro de la pantalla (Mira / Mouse)
-				local screenPosition, onScreen = Camera:WorldToViewportPoint(player.Character.HumanoidRootPart.Position)
-				
-				if onScreen then
-					local mouseLocation = Camera.ViewportSize / 2
-					local distance = (Vector2.new(screenPosition.X, screenPosition.Y) - mouseLocation).Magnitude
+				-- NUEVO: Validación de Wall Check antes de calcular distancia
+				if isVisible(player.Character) then
+					local screenPosition, onScreen = Camera:WorldToViewportPoint(player.Character.HumanoidRootPart.Position)
 					
-					if distance < shortestDistance then
-						closestPlayer = player
-						shortestDistance = distance
+					if onScreen then
+						local mouseLocation = Camera.ViewportSize / 2
+						local distance = (Vector2.new(screenPosition.X, screenPosition.Y) - mouseLocation).Magnitude
+						
+						if distance < shortestDistance then
+							closestPlayer = player
+							shortestDistance = distance
+						end
 					end
 				end
 				
@@ -134,59 +181,65 @@ local function getClosestStrictEnemy()
 	return closestPlayer
 end
 
+-- BUCLE DE LOCK CONTINUO Y DINÁMICO (Modificado según tus especificaciones)
 local function lockOnTarget()
 	if aimConnection then aimConnection:Disconnect() end
 	
 	aimConnection = RunService.RenderStepped:Connect(function()
+		if not isLocking then 
+			if aimConnection then aimConnection:Disconnect() end
+			return 
+		end
+
 		local myTeam = LocalPlayer.Team
 		if not myTeam then return end
 		
 		local enemyTeams = {}
 		if myTeam.Name == "Guards" then
-			enemyTeams["Criminals"] = true
-			enemyTeams["Inmates"] = true
+			enemyTeams["Criminals"] = true; enemyTeams["Inmates"] = true
 		elseif myTeam.Name == "Inmates" then
-			enemyTeams["Guards"] = true
-			enemyTeams["Criminals"] = true
+			enemyTeams["Guards"] = true; enemyTeams["Criminals"] = true
 		elseif myTeam.Name == "Criminals" then
-			enemyTeams["Guards"] = true
-			enemyTeams["Inmates"] = true
+			enemyTeams["Guards"] = true; enemyTeams["Inmates"] = true
 		end
 		
-		if isLocking and targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") and targetPlayer.Character:FindFirstChildOfClass("Humanoid").Health > 0 and targetPlayer.Team and enemyTeams[targetPlayer.Team.Name] then
-			
+		-- Verificación del objetivo actual
+		local isTargetValid = targetPlayer and targetPlayer.Character and 
+		                      targetPlayer.Character:FindFirstChild("HumanoidRootPart") and 
+		                      targetPlayer.Character:FindFirstChildOfClass("Humanoid").Health > 0 and 
+		                      targetPlayer.Team and enemyTeams[targetPlayer.Team.Name]
+
+		-- NUEVO: Si no es válido o se escondió detrás de una pared, buscamos al siguiente inmediatamente
+		if not isTargetValid or not isVisible(targetPlayer.Character) then
+			targetPlayer = getClosestStrictEnemy()
+		end
+		
+		-- Si encontramos un contrincante válido y visible tras la búsqueda continua, lo apuntamos
+		if targetPlayer and targetPlayer.Character and targetPlayer.Character:FindFirstChild("HumanoidRootPart") and isVisible(targetPlayer.Character) then
 			local targetPart = targetPlayer.Character.HumanoidRootPart
-			Camera.CFrame = CFrame.new(Camera.CFrame.Position, targetPart.Position)
-		else
-			if isLocking then
-				isLocking = false
-				aimButton.BackgroundColor3 = Color3.fromRGB(220, 50, 50) 
-				aimButton.Text = "LOCK"
-				if aimConnection then aimConnection:Disconnect() end
-			end
+			-- Cambiado a lookAt para total fluidez en Delta Mobile sin bugs de inversión de pantalla
+			Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, targetPart.Position)
 		end
 	end)
 end
 
 aimButton.MouseButton1Click:Connect(function()
 	if not isLocking then
-		targetPlayer = getClosestStrictEnemy()
-		if targetPlayer then
-			isLocking = true
-			aimButton.BackgroundColor3 = Color3.fromRGB(50, 220, 50) 
-			aimButton.Text = "UNLOCK"
-			lockOnTarget()
-		end
+		isLocking = true
+		aimButton.BackgroundColor3 = Color3.fromRGB(50, 220, 50) -- Verde (Activado)
+		aimButton.Text = "UNLOCK"
+		lockOnTarget()
 	else
 		isLocking = false
-		aimButton.BackgroundColor3 = Color3.fromRGB(220, 50, 50) 
+		aimButton.BackgroundColor3 = Color3.fromRGB(220, 50, 50) -- Rojo (Desactivado)
 		aimButton.Text = "LOCK"
 		if aimConnection then aimConnection:Disconnect() end
+		targetPlayer = nil
 	end
 end)
 
 
--- 3. SISTEMA DE ESP (SPY PLAYERS)
+-- 3. SISTEMA DE ESP (SPY PLAYERS - Intacto como tu original)
 local function createEspTag(player, color)
 	if player.Character and player.Character:FindFirstChild("Head") then
 		local head = player.Character.Head
@@ -248,7 +301,7 @@ local function updateEspSystem()
 end
 
 spyButton.MouseButton1Click:Connect(function()
-	spyPlayersActive = not spyPlayersActive
+	not spyPlayersActive = not spyPlayersActive
 	
 	if spyPlayersActive then
 		spyButton.BackgroundColor3 = Color3.fromRGB(50, 220, 50) 
